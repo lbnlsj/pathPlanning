@@ -11,13 +11,13 @@ class GraphAttention:
         - 使用softmax归一化注意力权重
     2. 输出: 聚合后的node特征
 
-class Actor(GNN):
+class Actor(GCN):
     1. 图注意力层1: state维度 -> 64维
     2. 图注意力层2: 64维 -> 32维 
     3. 全连接层: 32维 -> action维度
     4. 输出: softmax(action)
 
-class Critic(GNN):
+class Critic(GCN):
     1. 图注意力层1: (state维度 + action维度) -> 64维
     2. 图注意力层2: 64维 -> 32维
     3. 全连接层: 32维 -> 1维(Q值)
