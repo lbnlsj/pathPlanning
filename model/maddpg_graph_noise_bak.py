@@ -7,9 +7,28 @@ from collections import deque
 import random
 
 
+class GraphConvolution(nn.Module):
+    """图卷积层"""
+    def __init__(self, in_features, out_features):
+        super(GraphConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        self.bias = nn.Parameter(torch.FloatTensor(out_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x, adj):
+        support = torch.mm(x, self.weight)
+        output = torch.sparse.mm(adj, support)
+        return output + self.bias
+
+
 class GraphAttention(nn.Module):
     """图注意力层"""
-
     def __init__(self, in_features, out_features, dropout=0.6, alpha=0.2):
         super(GraphAttention, self).__init__()
         self.dropout = dropout
@@ -27,7 +46,7 @@ class GraphAttention(nn.Module):
         # 计算注意力系数
         N = h.size()[0]
         a_input = torch.cat([h.repeat_interleave(N, dim=0),
-                             h.repeat(N, 1)], dim=1)  # [N * N, 2 * out_features]
+                           h.repeat(N, 1)], dim=1)  # [N * N, 2 * out_features]
         e = self.leakyrelu(self.a(a_input).squeeze(1))  # [N * N]
         e = e.view(N, N)  # [N, N]
         zero_vec = -9e15 * torch.ones_like(e)
@@ -39,40 +58,58 @@ class GraphAttention(nn.Module):
         return h_prime
 
 
-class Actor(nn.Module):
-    """带图注意力的Actor网络"""
+class CombinedGraphLayer(nn.Module):
+    """结合GCN和GAT的混合层"""
+    def __init__(self, in_features, out_features, dropout=0.6, alpha=0.2):
+        super(CombinedGraphLayer, self).__init__()
+        self.gcn = GraphConvolution(in_features, out_features)
+        self.gat = GraphAttention(in_features, out_features, dropout, alpha)
+        self.weight = nn.Parameter(torch.FloatTensor([0.5]))  # 可学习的权重
 
+    def forward(self, x, adj):
+        gcn_out = self.gcn(x, adj)
+        gat_out = self.gat(x, adj)
+        # 使用可学习的权重组合GCN和GAT的输出
+        combined = self.weight * gcn_out + (1 - self.weight) * gat_out
+        return combined
+
+
+class Actor(nn.Module):
+    """带图卷积和图注意力的Actor网络"""
     def __init__(self, state_dim, action_dim):
         super(Actor, self).__init__()
-        self.gat1 = GraphAttention(state_dim, 64)
-        self.gat2 = GraphAttention(64, 32)
+        self.combined1 = CombinedGraphLayer(state_dim, 64)
+        self.combined2 = CombinedGraphLayer(64, 32)
         self.fc1 = nn.Linear(32, 64)
         self.fc2 = nn.Linear(64, 64)
         self.fc3 = nn.Linear(64, action_dim)
+        self.ln1 = nn.LayerNorm(64)
+        self.ln2 = nn.LayerNorm(32)
 
     def forward(self, state, adj_matrix):
-        x = F.relu(self.gat1(state, adj_matrix))
-        x = F.relu(self.gat2(x, adj_matrix))
+        x = F.relu(self.ln1(self.combined1(state, adj_matrix)))
+        x = F.relu(self.ln2(self.combined2(x, adj_matrix)))
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         return F.softmax(self.fc3(x), dim=-1)
 
 
 class Critic(nn.Module):
-    """带图注意力的Critic网络"""
-
+    """带图卷积和图注意力的Critic网络"""
     def __init__(self, state_dim, action_dim, n_agents):
         super(Critic, self).__init__()
-        self.gat1 = GraphAttention(state_dim + action_dim, 64)
-        self.gat2 = GraphAttention(64, 32)
+        self.combined1 = CombinedGraphLayer(state_dim + action_dim, 64)
+        self.combined2 = CombinedGraphLayer(64, 32)
         self.fc1 = nn.Linear(32, 64)
         self.fc2 = nn.Linear(64, 64)
         self.fc3 = nn.Linear(64, 1)
+        self.ln1 = nn.LayerNorm(64)
+        self.ln2 = nn.LayerNorm(32)
 
     def forward(self, state, action, adj_matrix):
         x = torch.cat([state, action], dim=1)
-        x = F.relu(self.gat1(x, adj_matrix))
-        x = F.relu(self.gat2(x, adj_matrix))
+        x = F.relu(self.ln1(self.combined1(x, adj_matrix)))
+        x = F.relu(self.ln2(self.combined2(x, adj_matrix)))
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         return self.fc3(x)
@@ -80,7 +117,6 @@ class Critic(nn.Module):
 
 class OUNoise:
     """Ornstein-Uhlenbeck噪声"""
-
     def __init__(self, size, mu=0., theta=0.15, sigma=0.2):
         self.mu = mu * np.ones(size)
         self.theta = theta
@@ -99,7 +135,6 @@ class OUNoise:
 
 class ParamNoise:
     """参数空间噪声"""
-
     def __init__(self, initial_stddev=0.1, desired_action_stddev=0.1, adoption_coefficient=1.01):
         self.initial_stddev = initial_stddev
         self.desired_action_stddev = desired_action_stddev
@@ -119,7 +154,6 @@ class ParamNoise:
 
 class Memory:
     """经验回放缓冲区"""
-
     def __init__(self, max_size):
         self.buffer = deque(maxlen=max_size)
 
@@ -144,7 +178,6 @@ class Memory:
 
 class EMADDPG:
     """增强型MADDPG智能体"""
-
     def __init__(self, state_dim, action_dim, n_agents, lr_actor=1e-4, lr_critic=1e-3, gamma=0.95, tau=0.01):
         self.n_agents = n_agents
         self.gamma = gamma
@@ -158,9 +191,9 @@ class EMADDPG:
 
         # 创建优化器
         self.actor_optimizers = [optim.Adam(self.actors[i].parameters(), lr=lr_actor)
-                                 for i in range(n_agents)]
+                               for i in range(n_agents)]
         self.critic_optimizers = [optim.Adam(self.critics[i].parameters(), lr=lr_critic)
-                                  for i in range(n_agents)]
+                                for i in range(n_agents)]
 
         # 初始化目标网络
         for i in range(n_agents):
@@ -231,8 +264,8 @@ class EMADDPG:
             next_actions = torch.stack(next_actions).transpose(0, 1)
 
             target_q = rewards[:, i].unsqueeze(1) + \
-                       self.gamma * (1 - dones[:, i].unsqueeze(1)) * \
-                       self.critics_target[i](next_states, next_actions, adj_matrices)
+                      self.gamma * (1 - dones[:, i].unsqueeze(1)) * \
+                      self.critics_target[i](next_states, next_actions, adj_matrices)
 
             current_q = self.critics[i](states, actions, adj_matrices)
             critic_loss = F.mse_loss(current_q, target_q.detach())
